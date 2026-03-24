@@ -8,6 +8,7 @@ import (
     "net/http"
     "os"
     "time"
+    "context"
 
     "github.com/gin-gonic/gin"
     "github.com/gorilla/websocket"
@@ -15,7 +16,6 @@ import (
     "github.com/redis/go-redis/v9"
     "golang.org/x/crypto/bcrypt"
     "github.com/golang-jwt/jwt/v5"
-    "context"
 )
 
 var (
@@ -24,10 +24,10 @@ var (
             return true
         },
     }
-    db        *sql.DB
-    redisClient *redis.Client
-    clients   = make(map[*websocket.Conn]string)
-    broadcast = make(chan Message)
+    db           *sql.DB
+    redisClient  *redis.Client
+    clients      = make(map[*websocket.Conn]string)
+    broadcast    = make(chan Message)
 )
 
 type User struct {
@@ -70,6 +70,12 @@ func initDB() {
         log.Fatal("Failed to connect to database:", err)
     }
 
+    // Test connection
+    err = db.Ping()
+    if err != nil {
+        log.Fatal("Failed to ping database:", err)
+    }
+
     // Create tables
     createTableSQL := `
     CREATE TABLE IF NOT EXISTS users (
@@ -82,13 +88,16 @@ func initDB() {
     
     CREATE TABLE IF NOT EXISTS messages (
         id SERIAL PRIMARY KEY,
-        from_user INTEGER REFERENCES users(id),
-        to_user INTEGER REFERENCES users(id),
+        from_user INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        to_user INTEGER REFERENCES users(id) ON DELETE CASCADE,
         content TEXT NOT NULL,
         type VARCHAR(20) DEFAULT 'text',
         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         status VARCHAR(20) DEFAULT 'sent'
-    );`
+    );
+    
+    CREATE INDEX IF NOT EXISTS idx_messages_users ON messages(from_user, to_user);
+    CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);`
     
     _, err = db.Exec(createTableSQL)
     if err != nil {
@@ -99,8 +108,9 @@ func initDB() {
 }
 
 func initRedis() {
+    redisAddr := fmt.Sprintf("%s:%s", os.Getenv("REDIS_HOST"), os.Getenv("REDIS_PORT"))
     redisClient = redis.NewClient(&redis.Options{
-        Addr:     fmt.Sprintf("%s:%s", os.Getenv("REDIS_HOST"), os.Getenv("REDIS_PORT")),
+        Addr:     redisAddr,
         Password: "",
         DB:       0,
     })
@@ -120,6 +130,12 @@ func registerUser(c *gin.Context) {
         return
     }
     
+    // Validate input
+    if req.Phone == "" || req.Name == "" || req.Password == "" {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "All fields are required"})
+        return
+    }
+    
     // Hash password
     hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
     if err != nil {
@@ -134,7 +150,7 @@ func registerUser(c *gin.Context) {
     ).Scan(&userID)
     
     if err != nil {
-        if err.(*pq.Error).Code == "23505" {
+        if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
             c.JSON(http.StatusConflict, gin.H{"error": "Phone number already registered"})
             return
         }
@@ -165,7 +181,11 @@ func loginUser(c *gin.Context) {
     ).Scan(&user.ID, &user.Phone, &user.Name, &hashedPassword)
     
     if err != nil {
-        c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+        if err == sql.ErrNoRows {
+            c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+            return
+        }
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
         return
     }
     
@@ -187,7 +207,8 @@ func loginUser(c *gin.Context) {
 func generateJWT(userID int) string {
     token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
         "user_id": userID,
-        "exp":     time.Now().Add(time.Hour * 24).Unix(),
+        "exp":     time.Now().Add(time.Hour * 24 * 7).Unix(),
+        "iat":     time.Now().Unix(),
     })
     
     tokenString, _ := token.SignedString([]byte(os.Getenv("JWT_SECRET")))
@@ -204,6 +225,9 @@ func authMiddleware() gin.HandlerFunc {
         }
         
         token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+            if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+                return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+            }
             return []byte(os.Getenv("JWT_SECRET")), nil
         })
         
@@ -213,8 +237,21 @@ func authMiddleware() gin.HandlerFunc {
             return
         }
         
-        claims := token.Claims.(jwt.MapClaims)
-        c.Set("user_id", int(claims["user_id"].(float64)))
+        claims, ok := token.Claims.(jwt.MapClaims)
+        if !ok {
+            c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token claims"})
+            c.Abort()
+            return
+        }
+        
+        userID, ok := claims["user_id"].(float64)
+        if !ok {
+            c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid user ID in token"})
+            c.Abort()
+            return
+        }
+        
+        c.Set("user_id", int(userID))
         c.Next()
     }
 }
@@ -241,6 +278,7 @@ func handleWebSocket(c *gin.Context) {
         var msg Message
         err := conn.ReadJSON(&msg)
         if err != nil {
+            log.Printf("User %d disconnected: %v", userID, err)
             delete(clients, conn)
             redisClient.Del(ctx, fmt.Sprintf("user:%d", userID))
             break
@@ -288,7 +326,7 @@ func storeOfflineMessage(userID int, msg Message) {
     key := fmt.Sprintf("offline:%d", userID)
     data, _ := json.Marshal(msg)
     redisClient.LPush(ctx, key, data)
-    redisClient.Expire(ctx, key, time.Hour*24)
+    redisClient.Expire(ctx, key, time.Hour*24*7) // Keep offline messages for 7 days
 }
 
 func loadOfflineMessages(conn *websocket.Conn, userID int) {
@@ -300,12 +338,17 @@ func loadOfflineMessages(conn *websocket.Conn, userID int) {
         return
     }
     
-    for _, msgData := range messages {
+    for i := len(messages) - 1; i >= 0; i-- {
         var msg Message
-        json.Unmarshal([]byte(msgData), &msg)
-        conn.WriteJSON(msg)
-        // Update status
-        db.Exec("UPDATE messages SET status = 'delivered' WHERE id = $1", msg.ID)
+        if err := json.Unmarshal([]byte(messages[i]), &msg); err != nil {
+            continue
+        }
+        if err := conn.WriteJSON(msg); err != nil {
+            log.Printf("Failed to send offline message to user %d: %v", userID, err)
+        } else {
+            // Update message status
+            db.Exec("UPDATE messages SET status = 'delivered' WHERE id = $1", msg.ID)
+        }
     }
     
     redisClient.Del(ctx, key)
@@ -314,7 +357,7 @@ func loadOfflineMessages(conn *websocket.Conn, userID int) {
 func getUsers(c *gin.Context) {
     userID := c.GetInt("user_id")
     
-    rows, err := db.Query("SELECT id, phone, name FROM users WHERE id != $1", userID)
+    rows, err := db.Query("SELECT id, phone, name FROM users WHERE id != $1 ORDER BY name", userID)
     if err != nil {
         c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch users"})
         return
@@ -322,12 +365,13 @@ func getUsers(c *gin.Context) {
     defer rows.Close()
     
     var users []User
+    ctx := context.Background()
+    
     for rows.Next() {
         var u User
         rows.Scan(&u.ID, &u.Phone, &u.Name)
         
         // Check online status
-        ctx := context.Background()
         _, err := redisClient.Get(ctx, fmt.Sprintf("user:%d", u.ID)).Result()
         if err == nil {
             u.Name = u.Name + " (Online)"
@@ -367,8 +411,14 @@ func getMessages(c *gin.Context) {
 }
 
 func main() {
+    // Initialize database and Redis
     initDB()
     initRedis()
+    
+    // Set Gin mode
+    if os.Getenv("GIN_MODE") == "release" {
+        gin.SetMode(gin.ReleaseMode)
+    }
     
     router := gin.Default()
     
@@ -377,6 +427,8 @@ func main() {
         c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
         c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        c.Writer.Header().Set("Access-Control-Max-Age", "86400")
+        
         if c.Request.Method == "OPTIONS" {
             c.AbortWithStatus(204)
             return
@@ -387,6 +439,9 @@ func main() {
     // Public routes
     router.POST("/api/register", registerUser)
     router.POST("/api/login", loginUser)
+    router.GET("/health", func(c *gin.Context) {
+        c.JSON(http.StatusOK, gin.H{"status": "healthy"})
+    })
     
     // Protected routes
     authorized := router.Group("/api")
@@ -402,5 +457,6 @@ func main() {
         port = "8080"
     }
     
+    log.Printf("Server starting on port %s", port)
     router.Run(":" + port)
 }
