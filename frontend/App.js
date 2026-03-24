@@ -8,8 +8,7 @@ import {
   View,
   FlatList,
   Alert,
-  KeyboardAvoidingView,
-  Platform,
+  ActivityIndicator,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { NavigationContainer } from '@react-navigation/native';
@@ -18,8 +17,14 @@ import { GiftedChat, Bubble, Send } from 'react-native-gifted-chat';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 
 const Stack = createStackNavigator();
-const API_URL = 'http://your-backend-service/api'; // Update with your K8s service URL
-const WS_URL = 'ws://your-backend-service/api/ws'; // Update with your K8s service URL
+
+// Update these URLs based on your environment
+const API_URL = 'http://localhost:8080/api'; // For web
+// const API_URL = 'http://10.0.2.2:8080/api'; // For Android emulator
+// const API_URL = 'http://YOUR_IP:8080/api'; // For physical device
+
+const WS_URL = 'ws://localhost:8080/api/ws'; // For web
+// const WS_URL = 'ws://10.0.2.2:8080/api/ws'; // For Android emulator
 
 // Login Screen
 function LoginScreen({ navigation }) {
@@ -51,7 +56,8 @@ function LoginScreen({ navigation }) {
         Alert.alert('Error', data.error || 'Login failed');
       }
     } catch (error) {
-      Alert.alert('Error', 'Network error');
+      Alert.alert('Error', 'Network error. Make sure the backend is running.');
+      console.error(error);
     } finally {
       setLoading(false);
     }
@@ -124,7 +130,8 @@ function RegisterScreen({ navigation }) {
         Alert.alert('Error', data.error || 'Registration failed');
       }
     } catch (error) {
-      Alert.alert('Error', 'Network error');
+      Alert.alert('Error', 'Network error. Make sure the backend is running.');
+      console.error(error);
     } finally {
       setLoading(false);
     }
@@ -171,22 +178,36 @@ function RegisterScreen({ navigation }) {
 function ChatListScreen({ navigation }) {
   const [users, setUsers] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [userName, setUserName] = useState('');
 
   useEffect(() => {
+    loadUserName();
     fetchUsers();
-    const interval = setInterval(fetchUsers, 5000); // Refresh every 5 seconds
+    const interval = setInterval(fetchUsers, 5000);
     return () => clearInterval(interval);
   }, []);
+
+  const loadUserName = async () => {
+    const name = await AsyncStorage.getItem('userName');
+    setUserName(name || 'User');
+  };
 
   const fetchUsers = async () => {
     try {
       const token = await AsyncStorage.getItem('userToken');
+      if (!token) {
+        navigation.replace('Login');
+        return;
+      }
+      
       const response = await fetch(`${API_URL}/users`, {
         headers: { 'Authorization': token },
       });
       const data = await response.json();
       if (response.ok) {
         setUsers(data);
+      } else if (response.status === 401) {
+        navigation.replace('Login');
       }
     } catch (error) {
       console.error('Error fetching users:', error);
@@ -218,13 +239,16 @@ function ChatListScreen({ navigation }) {
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.chatListHeader}>
-        <Text style={styles.headerTitle}>Chats</Text>
+        <View>
+          <Text style={styles.headerTitle}>Chats</Text>
+          <Text style={styles.userGreeting}>Hello, {userName}</Text>
+        </View>
         <TouchableOpacity onPress={handleLogout}>
-          <Icon name="logout" size={24} color="#075E54" />
+          <Icon name="logout" size={24} color="#fff" />
         </TouchableOpacity>
       </View>
       {loading ? (
-        <Text style={styles.loadingText}>Loading...</Text>
+        <ActivityIndicator size="large" color="#075E54" style={styles.loader} />
       ) : (
         <FlatList
           data={users}
@@ -245,6 +269,7 @@ function ChatScreen({ route, navigation }) {
   const [currentUserId, setCurrentUserId] = useState(null);
 
   useEffect(() => {
+    navigation.setOptions({ title: userName.replace(' (Online)', '') });
     loadCurrentUser();
     loadMessages();
     connectWebSocket();
@@ -257,8 +282,8 @@ function ChatScreen({ route, navigation }) {
   }, []);
 
   const loadCurrentUser = async () => {
-    const userId = await AsyncStorage.getItem('userId');
-    setCurrentUserId(parseInt(userId));
+    const id = await AsyncStorage.getItem('userId');
+    setCurrentUserId(parseInt(id));
   };
 
   const loadMessages = async () => {
@@ -295,7 +320,7 @@ function ChatScreen({ route, navigation }) {
     
     websocket.onmessage = (event) => {
       const message = JSON.parse(event.data);
-      if (message.from_user === userId) {
+      if (message.from_user === parseInt(userId)) {
         setMessages(previousMessages =>
           GiftedChat.append(previousMessages, [{
             _id: message.id,
@@ -311,6 +336,12 @@ function ChatScreen({ route, navigation }) {
       console.error('WebSocket error:', error);
     };
     
+    websocket.onclose = () => {
+      console.log('WebSocket disconnected');
+      // Attempt to reconnect after 3 seconds
+      setTimeout(connectWebSocket, 3000);
+    };
+    
     setWs(websocket);
   };
 
@@ -318,7 +349,7 @@ function ChatScreen({ route, navigation }) {
     const message = newMessages[0];
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
-        to_user: userId,
+        to_user: parseInt(userId),
         content: message.text,
         type: 'text',
       }));
@@ -342,6 +373,10 @@ function ChatScreen({ route, navigation }) {
               right: { backgroundColor: '#DCF8C6' },
               left: { backgroundColor: '#FFFFFF' },
             }}
+            textStyle={{
+              right: { color: '#000' },
+              left: { color: '#000' },
+            }}
           />
         )}
         renderSend={(props) => (
@@ -363,7 +398,17 @@ export default function App() {
         <Stack.Screen name="Login" component={LoginScreen} options={{ headerShown: false }} />
         <Stack.Screen name="Register" component={RegisterScreen} options={{ headerShown: false }} />
         <Stack.Screen name="ChatList" component={ChatListScreen} options={{ headerShown: false }} />
-        <Stack.Screen name="Chat" component={ChatScreen} options={{ title: '' }} />
+        <Stack.Screen 
+          name="Chat" 
+          component={ChatScreen} 
+          options={({ route }) => ({ 
+            title: route.params?.userName?.replace(' (Online)', '') || 'Chat',
+            headerStyle: {
+              backgroundColor: '#075E54',
+            },
+            headerTintColor: '#fff',
+          })} 
+        />
       </Stack.Navigator>
     </NavigationContainer>
   );
@@ -429,6 +474,11 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     color: '#fff',
   },
+  userGreeting: {
+    fontSize: 12,
+    color: '#fff',
+    marginTop: 4,
+  },
   userItem: {
     flexDirection: 'row',
     padding: 15,
@@ -457,10 +507,8 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#666',
   },
-  loadingText: {
-    textAlign: 'center',
+  loader: {
     marginTop: 50,
-    fontSize: 16,
   },
   emptyText: {
     textAlign: 'center',
